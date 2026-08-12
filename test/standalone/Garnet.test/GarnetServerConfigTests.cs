@@ -131,6 +131,22 @@ namespace Garnet.test
         }
 
         [Test]
+        public void UseLegacyBufferPoolOptionParsing()
+        {
+            // Default: origin-return pool is used (legacy flag off).
+            var ok = ServerSettingsManager.TryParseCommandLineArguments([], out var options, out _, out _, out _, silentMode: true);
+            ClassicAssert.IsTrue(ok);
+            ClassicAssert.IsFalse(options.UseLegacyBufferPool.GetValueOrDefault());
+            ClassicAssert.IsFalse(options.GetServerOptions().UseLegacyBufferPool);
+
+            // Flag selects the legacy per-level ConcurrentQueue pool.
+            ok = ServerSettingsManager.TryParseCommandLineArguments(["--use-legacy-buffer-pool", "true"], out options, out _, out _, out _, silentMode: true);
+            ClassicAssert.IsTrue(ok);
+            ClassicAssert.IsTrue(options.UseLegacyBufferPool.GetValueOrDefault());
+            ClassicAssert.IsTrue(options.GetServerOptions().UseLegacyBufferPool);
+        }
+
+        [Test]
         public void LoadModuleCsInvalidSpecIsRejected()
         {
             // A malformed quoted module specification must be rejected by validation rather than silently ignored.

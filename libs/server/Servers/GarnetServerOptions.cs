@@ -31,6 +31,15 @@ namespace Garnet.server
         public NativeAllocatorSurfaces NativeAllocatorSurfaces = NativeAllocatorSurfaces.None;
 
         /// <summary>
+        /// Use the legacy per-level <c>ConcurrentQueue</c> <see cref="SectorAlignedBufferPool"/> instead of the
+        /// default origin-return (per-thread magazine) pool. The origin-return pool scales far better under many
+        /// concurrent IO-completion threads; this flag is a rollback/kill-switch for A/B comparison. Installed at
+        /// startup by toggling <see cref="SectorAlignedBufferPool.UseOriginReturn"/> before any pool is created.
+        /// Has no effect when a native buffer-pool backend is selected via <see cref="NativeAllocatorSurfaces"/>.
+        /// </summary>
+        public bool UseLegacyBufferPool = false;
+
+        /// <summary>
         /// Enable cluster.
         /// </summary>
         public bool EnableCluster = false;

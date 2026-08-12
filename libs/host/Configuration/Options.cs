@@ -90,6 +90,10 @@ namespace Garnet
         [Option("native-allocator", Required = false, HelpText = "Route large/pooled memory through a native (off-managed-heap) allocator. Values: off (default), buffer-pool (SectorAlignedBufferPool IO buffers via mimalloc), full (also routes log pages / hash index / frames to a direct-VM allocator). buffer-pool and full require the mimalloc native library; if it cannot be loaded for the platform, startup fails (rather than silently using the managed pool). Set off to run fully managed.")]
         public string NativeAllocator { get; set; }
 
+        [OptionValidation]
+        [Option("use-legacy-buffer-pool", Required = false, HelpText = "Use the legacy per-level ConcurrentQueue SectorAlignedBufferPool instead of the default origin-return (per-thread magazine) pool. The origin-return pool scales far better under many concurrent IO-completion threads; this flag is a rollback/kill-switch for A/B comparison. Ignored when --native-allocator selects a native buffer-pool backend.")]
+        public bool? UseLegacyBufferPool { get; set; }
+
         [PercentageValidation(false)]
         [Option("mutable-percent", Required = false, HelpText = "Percentage of log memory that is kept mutable")]
         public int MutablePercent { get; set; }
@@ -892,6 +896,7 @@ namespace Garnet
                 IndexMemorySize = IndexMemorySize,
                 IndexMaxMemorySize = IndexMaxMemorySize,
                 NativeAllocatorSurfaces = ParseNativeAllocatorMode(NativeAllocator, logger),
+                UseLegacyBufferPool = UseLegacyBufferPool.GetValueOrDefault(),
                 MutablePercent = MutablePercent,
                 EnableReadCache = EnableReadCache.GetValueOrDefault(),
                 ReadCacheMemorySize = ReadCacheMemorySize,

@@ -110,10 +110,43 @@ namespace Tsavorite.core
         internal int allocatedLength;
 
         /// <summary>
-        /// Thread-local wrapper free-list link. On the native path the large backing buffer is owned/recycled
-        /// by the native allocator, but the small wrapper object is recycled here to avoid Gen0 churn.
+        /// Intrusive singly-linked list link. A buffer is in <b>exactly one</b> list at a time, so a single link
+        /// serves every list it may join: the origin-return owner-local stack, the cross-thread Treiber stack,
+        /// the pool depot, and (on the native path) the recycled-wrapper free list. Cleared before a buffer is
+        /// handed to a renter so a long-lived rental never roots a chain.
         /// </summary>
-        internal SectorAlignedMemory wrapperNext;
+        internal SectorAlignedMemory next;
+
+        /// <summary>
+        /// Origin-return owner: the exact <c>(pool, thread, size-class)</c> bucket that owns this buffer's
+        /// <b>current</b> rental. Set at <see cref="SectorAlignedBufferPool.Get(int,bool)"/>; the matching
+        /// cross-thread <see cref="SectorAlignedBufferPool.Return(SectorAlignedMemory)"/> routes the buffer back
+        /// to this bucket's owner thread (mimalloc <c>xthread_free</c> style) rather than to the freeing thread.
+        /// Cleared when the buffer migrates into the pool depot (so a depot entry never roots a retired shard).
+        /// </summary>
+        internal Bucket originBucket;
+
+        /// <summary>
+        /// Standalone byte-budget accounting object this buffer's poolability permit was reserved against.
+        /// Held directly (not via <see cref="pool"/>) so the permit can be released even after the pool is
+        /// closed (e.g. from a retired shard's finalizer). Null for non-cacheable / bypass buffers.
+        /// </summary>
+        internal BudgetState budget;
+
+        /// <summary>
+        /// Poolability-permit size in bytes reserved against <see cref="budget"/> when this buffer was first
+        /// designated cacheable (at allocation). Persists unchanged while the buffer cycles through
+        /// rented → local → xthread → depot states; released exactly once (guarded by
+        /// <see cref="permitReleased"/>) when the buffer is permanently dropped. 0 when non-cacheable.
+        /// </summary>
+        internal long permitBytes;
+
+        /// <summary>Exactly-once release guard for <see cref="permitBytes"/> (CAS 0 → 1). </summary>
+        internal int permitReleased;
+
+        /// <summary>True when this buffer holds a poolability permit and may re-enter the pool's caches on
+        /// Return; false for bypass/overflow buffers that are dropped on Return.</summary>
+        internal bool cacheable;
 
         private int level;
         internal int Level => level
@@ -286,7 +319,20 @@ namespace Tsavorite.core
     /// queue represents a memory of size in particular range. queue[i] contains memory 
     /// segments each of size (2^i * sectorSize).
     /// </summary>
-    public sealed class SectorAlignedBufferPool
+    /// <summary>
+    /// SectorAlignedBufferPool is a pool of memory.
+    /// <para>
+    /// The default managed backend is an <b>origin-return</b> per-thread pool (mimalloc <c>xthread_free</c>
+    /// style): buffers are cached on the thread that <see cref="Get(int,bool)"/>s them and, when
+    /// <see cref="Return(SectorAlignedMemory)"/> fires on a different (IO-completion) thread, are routed back to
+    /// the originating thread rather than parking on the freeing thread. This scales with thread count without
+    /// the single-<c>ConcurrentQueue</c> cache-line contention of the legacy path, while a per-pool byte budget
+    /// bounds memory. Set <see cref="UseOriginReturn"/> = false at startup to fall back to the legacy path (an
+    /// array of per-level <c>ConcurrentQueue</c>s, <c>queue[i]</c> holding buffers of size
+    /// <c>2^i * sectorSize</c>). A native (mimalloc) allocator, if configured, supersedes both.
+    /// </para>
+    /// </summary>
+    public sealed partial class SectorAlignedBufferPool
     {
         /// <summary>
         /// Disable buffer pool.
@@ -300,6 +346,22 @@ namespace Tsavorite.core
         /// This static option should be enabled on program entry, and not modified once Tsavorite is instantiated.
         /// </summary>
         public static bool UnpinOnReturn;
+
+        /// <summary>
+        /// Selects the origin-return managed backend (default) over the legacy per-level <c>ConcurrentQueue</c>
+        /// path. Captured once per pool at construction into <see cref="originReturn"/> (so a toggled static can
+        /// never mix modes within a pool). Set at program entry only, mirroring <see cref="Disabled"/> /
+        /// <see cref="UnpinOnReturn"/>. Kept as a kill-switch for A/B and rollback.
+        /// </summary>
+        public static bool UseOriginReturn = true;
+
+        /// <summary>
+        /// Per-pool byte budget for the origin-return backend: the single hard bound on the total
+        /// <b>reusable</b> (cacheable) bytes the pool will retain across all threads/classes. Captured once per
+        /// pool at construction. An allocation that cannot reserve a permit against this budget is still served
+        /// to the caller but marked non-cacheable and dropped on Return. Default 1 GiB per pool.
+        /// </summary>
+        public static long ManagedBudgetBytes = 1L << 30;
 
         /// <summary>
         /// Optional native backing allocator for pooled IO buffers. When non-null (set once at startup for the
@@ -319,13 +381,17 @@ namespace Tsavorite.core
         /// through <see cref="INativePinnedAllocator"/>.</summary>
         private readonly bool nativeIsMimalloc;
 
-        /// <summary>Thread-local free list of recycled wrapper objects for the native path (see <see cref="SectorAlignedMemory.wrapperNext"/>).</summary>
-        [ThreadStatic]
-        private static SectorAlignedMemory t_wrapperFreeList;
+        /// <summary>Per-pool captured origin-return mode (see <see cref="UseOriginReturn"/>). Immutable for the pool's lifetime.</summary>
+        private readonly bool originReturn;
+
+        /// <summary>Per-pool captured unpin-on-return policy (see <see cref="UnpinOnReturn"/>). Read once at
+        /// construction so a buffer allocated under one pin policy is always returned under that policy.</summary>
+        private readonly bool unpinOnReturn;
 
         private const int levels = 32;
         private readonly int recordSize;
         private readonly int sectorSize;
+        private readonly int sectorSizeShift;   // Log2(sectorSize) if a power of two, else -1 (fall back to division)
         private readonly ConcurrentQueue<SectorAlignedMemory>[] queue;
 #if CHECK_FOR_LEAKS
         static int totalGets, totalReturns;
@@ -338,9 +404,9 @@ namespace Tsavorite.core
         /// <param name="sectorSize">Sector size, e.g. from log device</param>
         public SectorAlignedBufferPool(int recordSize, int sectorSize)
         {
-            queue = new ConcurrentQueue<SectorAlignedMemory>[levels];
             this.recordSize = recordSize;
             this.sectorSize = sectorSize;
+            sectorSizeShift = BitOperations.IsPow2((uint)sectorSize) ? BitOperations.Log2((uint)sectorSize) : -1;
 
             // Capture the native allocator once at construction. The static is the process-wide template set by
             // NativeAllocatorInitializer before any pool is built; capturing it per-pool makes each pool's backend
@@ -348,6 +414,20 @@ namespace Tsavorite.core
             // pool's outstanding native buffers (they still free through the captured allocator).
             nativeAllocator = NativeAllocator;
             nativeIsMimalloc = nativeAllocator is MimallocPooledAllocator;
+
+            // Capture the managed-mode and pin policy once so Get/Return route from immutable per-pool state:
+            // a buffer allocated under one mode/pin-policy is always returned under that mode (see the kill-switch).
+            unpinOnReturn = UnpinOnReturn;
+            originReturn = UseOriginReturn && nativeAllocator is null;
+
+            if (originReturn)
+            {
+                InitOriginReturn();
+            }
+            else
+            {
+                queue = new ConcurrentQueue<SectorAlignedMemory>[levels];
+            }
         }
 
         public void EnsureSize(ref SectorAlignedMemory page, int size)
@@ -391,6 +471,18 @@ namespace Tsavorite.core
                 return;
             }
 
+            if (originReturn)
+            {
+                ReturnOriginReturn(page);
+                return;
+            }
+
+            ReturnLegacy(page);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ReturnLegacy(SectorAlignedMemory page)
+        {
 #if CHECK_FREE
             page.Free = true;
 #endif // CHECK_FREE
@@ -474,10 +566,14 @@ namespace Tsavorite.core
 
             int required_bytes = numRecords * recordSize;
             int requiredSize = RoundUp(required_bytes, sectorSize);
-            int index = Position(requiredSize / sectorSize);
             var nativeAlloc = nativeAllocator;
             if (nativeAlloc is not null)
-                return GetNative(nativeAlloc, required_bytes, index, clearOnReturn);
+                return GetNative(nativeAlloc, required_bytes, Position(requiredSize / sectorSize), clearOnReturn);
+
+            if (originReturn)
+                return GetOriginReturn(required_bytes, requiredSize, clearOnReturn);
+
+            int index = Position(requiredSize / sectorSize);
             if (queue[index] == null)
             {
                 var localPool = new ConcurrentQueue<SectorAlignedMemory>();
@@ -597,26 +693,18 @@ namespace Tsavorite.core
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static SectorAlignedMemory RentWrapper()
-        {
-            var w = t_wrapperFreeList;
-            if (w is not null)
-            {
-                t_wrapperFreeList = w.wrapperNext;
-                w.wrapperNext = null;
-#if CHECK_FREE
-                w.Free = false;
-#endif
-                return w;
-            }
-            return new SectorAlignedMemory();
-        }
+        private static SectorAlignedMemory RentWrapper() => RentWrapperGlobal();
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static void ReturnWrapper(SectorAlignedMemory page)
         {
-            page.wrapperNext = t_wrapperFreeList;
-            t_wrapperFreeList = page;
+            // Wrappers are tiny, unpinned, pool-agnostic. Clear any pool/origin references so a cached wrapper
+            // cannot root a disposed pool, then hand it to the bounded striped global free list.
+            page.pool = null;
+            page.originBucket = null;
+            page.budget = null;
+            page.next = null;
+            ReturnWrapperGlobal(page);
         }
 
         /// <summary>
@@ -628,6 +716,14 @@ namespace Tsavorite.core
 #if CHECK_FOR_LEAKS
             Debug.Assert(totalGets == totalReturns);
 #endif
+            if (originReturn)
+            {
+                FreeOriginReturn();
+                return;
+            }
+
+            if (queue is null)
+                return;
             for (int i = 0; i < levels; i++)
             {
                 if (queue[i] == null) continue;
@@ -641,6 +737,13 @@ namespace Tsavorite.core
         /// </summary>
         public void Print()
         {
+            if (originReturn)
+            {
+                PrintOriginReturn();
+                return;
+            }
+            if (queue is null)
+                return;
             for (int i = 0; i < levels; i++)
             {
                 if (queue[i] == null) continue;

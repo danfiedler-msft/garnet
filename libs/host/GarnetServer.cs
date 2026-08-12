@@ -204,6 +204,11 @@ namespace Garnet
             // process-wide leftover (e.g. from the GARNET_NATIVE_ALLOCATOR env var) is reset to the managed path.
             NativeAllocatorInitializer.Initialize(opts.NativeAllocatorSurfaces, loggerFactory?.CreateLogger("NativeAllocator"));
 
+            // Select the managed SectorAlignedBufferPool backend before any pool is constructed (each pool captures
+            // this static once at construction). Default is the origin-return per-thread magazine pool; the flag is
+            // an operational rollback to the legacy per-level ConcurrentQueue pool.
+            SectorAlignedBufferPool.UseOriginReturn = !opts.UseLegacyBufferPool;
+
             // Flush initialization logs from memory logger
             FlushMemoryLogger(this.initLogger, "ArgParser", this.loggerFactory);
 
